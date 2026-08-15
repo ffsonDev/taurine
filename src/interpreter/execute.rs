@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use smallvec::SmallVec;
 use crate::value::GeneratorExecutionState;
+use crate::safety::{SecurityContext};
 
 fn get_global_packages_dir() -> PathBuf {
     let mut path = dirs::home_dir()
@@ -50,7 +51,6 @@ fn resolve_module_path(base_path: &PathBuf, module_path: &str) -> Option<PathBuf
                         .unwrap_or_default();
                     
                     if name == module_path || name.starts_with(&format!("{}-", module_path)) {
-                        // Найти .tau файлы в директории
                         if let Ok(files) = std::fs::read_dir(&path) {
                             for file in files.flatten() {
                                 let file_path = file.path();
@@ -93,12 +93,12 @@ pub struct Interpreter {
     current_line: usize,
     control_flow: ControlFlow,
     safety: SafetyContext,
+    security: crate::safety::SecurityContext,
     module_cache: Rc<RefCell<std::collections::HashMap<String, Value>>>,
     gc: Option<GarbageCollector>,
-    /// String interner for consistent identifier IDs
     pub(crate) interner: crate::string_intern::StringInterner,
     call_depth: usize,
-    this_stack: Vec<Value>, 
+    this_stack: Vec<Value>,
 }
 
 fn create_default_interner() -> crate::string_intern::StringInterner {
@@ -185,6 +185,7 @@ impl Interpreter {
     pub fn with_gc_and_interner(base_path: PathBuf, limits: SafetyLimits, gc_config: Option<GcConfig>, interner: crate::string_intern::StringInterner) -> Self {
         let global = Rc::new(RefCell::new(crate::environment::Environment::new()));
         let safety = SafetyContext::new(limits);
+        let security = crate::safety::SecurityContext::new();
         let gc = gc_config.map(GarbageCollector::new);
         let mut interp = Interpreter {
             global,
@@ -194,6 +195,7 @@ impl Interpreter {
             current_line: 1,
             control_flow: ControlFlow::None,
             safety,
+            security,
             interner,
             module_cache: Rc::new(RefCell::new(std::collections::HashMap::new())),
             gc,
@@ -201,8 +203,7 @@ impl Interpreter {
             this_stack: Vec::new(),
         };
         register_builtins(&interp.global);
-        interp.load_stdlib(); 
-        
+        interp.load_stdlib();
         interp
     }
 
@@ -310,6 +311,18 @@ impl Interpreter {
 
     pub fn safety(&self) -> &SafetyContext {
         &self.safety
+    }
+
+    pub fn security(&self) -> &crate::safety::SecurityContext {
+        &self.security
+    }
+
+    pub fn security_mut(&mut self) -> &mut crate::safety::SecurityContext {
+        &mut self.security
+    }
+
+    pub fn set_security_level(&mut self, level: crate::safety::SecurityLevel) {
+        self.security.apply_level(&level);
     }
 
     /// Get GC statistics if GC is enabled
@@ -976,6 +989,11 @@ impl Interpreter {
             Expr::Call { callee, arguments, line } => {
                 self.current_line = line;
                 if let Expr::Identifier(name) = &*callee {
+                    if let Some(func_name) = self.interner.get(name.id()) {
+                        if !self.security.is_function_allowed(func_name) {
+                            return Err(format!("Function '{}' is blocked by security policy", func_name));
+                        }
+                    }
                     if name.id() == 50 && arguments.len() == 1 {
                         let arg = self.execute_expr(arguments[0].clone())?;
                         if let Value::String(s) = arg {
@@ -1476,7 +1494,6 @@ impl Interpreter {
                     line: self.current_line,
                 });
                 let old_global = std::mem::replace(&mut self.global, new_env.clone());
-                let future_state = Rc::new(RefCell::new(crate::value::FutureState::Pending));
                 
                 let exec_result = (|| -> Result<Value, String> {
                     for stmt in &body {

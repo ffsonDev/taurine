@@ -14,12 +14,41 @@ use std::sync::OnceLock;
 
 /// Sanitize user-provided path to prevent path traversal attacks
 fn sanitize_path(user_path: &str) -> Result<PathBuf, String> {
+    sanitize_path_with_absolute(user_path, true)
+}
+
+fn sanitize_path_sandbox(user_path: &str) -> Result<PathBuf, String> {
+    sanitize_path_inner(user_path, false)
+}
+
+fn sanitize_path_inner(user_path: &str, allow_absolute: bool) -> Result<PathBuf, String> {
     let full_path = Path::new(user_path);
     let canonical = full_path.canonicalize()
         .map_err(|e| format!("Invalid path: {e}"))?;
     let current_dir = std::env::current_dir()
         .map_err(|e| format!("Cannot get current directory: {e}"))?;
     if user_path.starts_with('/') || user_path.chars().nth(1) == Some(':') {
+        if !allow_absolute {
+            return Err("Absolute paths are not allowed in sandbox mode".to_string());
+        }
+        return Ok(canonical);
+    }
+    if !canonical.starts_with(&current_dir) {
+        return Err("Path traversal detected: access outside current directory is not allowed".to_string());
+    }
+    Ok(canonical)
+}
+
+fn sanitize_path_with_absolute(user_path: &str, allow_absolute: bool) -> Result<PathBuf, String> {
+    let full_path = Path::new(user_path);
+    let canonical = full_path.canonicalize()
+        .map_err(|e| format!("Invalid path: {e}"))?;
+    let current_dir = std::env::current_dir()
+        .map_err(|e| format!("Cannot get current directory: {e}"))?;
+    if user_path.starts_with('/') || user_path.chars().nth(1) == Some(':') {
+        if !allow_absolute {
+            return Err("Absolute paths are not allowed in sandbox mode".to_string());
+        }
         return Ok(canonical);
     }
     if !canonical.starts_with(&current_dir) {
@@ -293,9 +322,10 @@ fn register_string_functions(global: &Rc<RefCell<crate::environment::Environment
     reg!(global, 34, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
         if args.len() < 2 { return Err("io_strfind() requires 2 arguments".to_string()); }
         if let (Value::String(s), Value::String(pattern)) = (&args[0], &args[1]) {
-            s.find(pattern.as_str())
-                .map(|i| Value::Number(i as f64 + 1.0))
-                .ok_or_else(|| "Pattern not found".to_string())
+            match s.find(pattern.as_str()) {
+                Some(i) => Ok(Value::Number(i as f64)),
+                None => Ok(Value::Number(-1.0)),
+            }
         } else { Err("io_strfind() requires two strings".to_string()) }
     });
 

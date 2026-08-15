@@ -114,7 +114,7 @@ pub enum FutureState {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Value::Number(a), Value::Number(b)) => (a - b).abs() < f64::EPSILON,
+            (Value::Number(a), Value::Number(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Nil, Value::Nil) => true,
@@ -122,7 +122,7 @@ impl PartialEq for Value {
             (Value::Range { start: s1, end: e1 }, Value::Range { start: s2, end: e2 }) => {
                 s1 == s2 && e1 == e2
             }
-            (Value::Future(_), Value::Future(_)) => false, // Futures are never equal by value
+            (Value::Future(_), Value::Future(_)) => false,
             (Value::Generator { .. }, Value::Generator { .. }) => false,
             (Value::AsyncFunction { name: n1, .. }, Value::AsyncFunction { name: n2, .. }) => n1 == n2,
             _ => false,
