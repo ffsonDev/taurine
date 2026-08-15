@@ -1666,7 +1666,42 @@ impl Interpreter {
             },
             Pattern::Identifier(_) => Ok(true),
             Pattern::Wildcard => Ok(true),
-            Pattern::Array(_) | Pattern::Table(_) => Ok(false),
+            Pattern::Array(patterns) => {
+                match value {
+                    Value::Array(arr) => {
+                        let arr_ref = arr.borrow();
+                        if arr_ref.len() != patterns.len() {
+                            return Ok(false);
+                        }
+                        for (pat, val) in patterns.iter().zip(arr_ref.iter()) {
+                            if !self.pattern_matches(pat, val)? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            }
+            Pattern::Table(entries) => {
+                match value {
+                    Value::Table(t) => {
+                        let t_ref = t.borrow();
+                        for (key, pat) in entries {
+                            match t_ref.get(&key.id()) {
+                                Some(val) => {
+                                    if !self.pattern_matches(pat, val)? {
+                                        return Ok(false);
+                                    }
+                                }
+                                None => return Ok(false),
+                            }
+                        }
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            }
         }
     }
 

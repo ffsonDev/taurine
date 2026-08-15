@@ -20,15 +20,70 @@ pub struct Parser {
     current: usize,
     interner: Option<StringInterner>,
     recursion_depth: usize,
+    errors: Vec<ParseError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    pub message: String,
+    pub line: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, current: 0, interner: None, recursion_depth: 0 }
+        Parser { tokens, current: 0, interner: None, recursion_depth: 0, errors: Vec::new() }
     }
 
     pub fn with_interner(tokens: Vec<Token>, interner: StringInterner) -> Self {
-        Parser { tokens, current: 0, interner: Some(interner), recursion_depth: 0 }
+        Parser { tokens, current: 0, interner: Some(interner), recursion_depth: 0, errors: Vec::new() }
+    }
+
+    pub fn errors(&self) -> &[ParseError] {
+        &self.errors
+    }
+
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    fn record_error(&mut self, message: String) {
+        let line = if self.current < self.tokens.len() {
+            self.tokens[self.current].line
+        } else {
+            0
+        };
+        self.errors.push(ParseError { message, line });
+    }
+
+    fn synchronize(&mut self) {
+        self.advance();
+        while !self.is_at_end() {
+            if self.previous().kind == TokenKind::Semicolon {
+                return;
+            }
+            match self.peek().kind {
+                TokenKind::Let | TokenKind::Const | TokenKind::Function |
+                TokenKind::If | TokenKind::While | TokenKind::For |
+                TokenKind::Return | TokenKind::Class | TokenKind::Import |
+                TokenKind::Export | TokenKind::Try | TokenKind::Async => return,
+                _ => {}
+            }
+            self.advance();
+        }
+    }
+
+    pub fn parse_with_recovery(&mut self) -> Program {
+        let mut statements = Vec::new();
+        while !self.is_at_end() {
+            match self.declaration() {
+                Ok(stmt) => statements.push(stmt),
+                Err(e) => {
+                    self.record_error(e);
+                    self.synchronize();
+                }
+            }
+        }
+        Program { statements }
     }
 
     pub fn parse(&mut self) -> Result<Program, String> {
@@ -822,6 +877,12 @@ impl Parser {
     fn pattern(&mut self) -> Result<Pattern, String> {
         let line = self.peek().line;
         if self.match_token(&TokenKind::Underscore) { return Ok(Pattern::Wildcard); }
+        if self.match_token(&TokenKind::LBracket) {
+            return self.array_pattern();
+        }
+        if self.match_token(&TokenKind::LBrace) {
+            return self.table_pattern();
+        }
         if self.match_token(&TokenKind::Identifier) {
             let name = self.intern(&self.previous().lexeme.clone());
             return Ok(Pattern::Identifier(name));
@@ -839,6 +900,16 @@ impl Parser {
             return Ok(Pattern::Literal(Expr::String(s[1..s.len()-1].to_string())));
         }
         Err(format!("Unexpected token in pattern: {:?}", self.peek().kind))
+    }
+
+    fn array_literal(&mut self, line: usize) -> Result<Expr, String> {
+        let mut items = Vec::new();
+        while !self.check(&TokenKind::RBracket) && !self.is_at_end() {
+            items.push(self.expression()?);
+            if !self.match_token(&TokenKind::Comma) { break; }
+        }
+        self.consume(&TokenKind::RBracket, "Expected ']' after array items")?;
+        Ok(Expr::Array { items, line })
     }
 
     fn table_literal(&mut self, line: usize) -> Result<Expr, String> {
@@ -861,14 +932,31 @@ impl Parser {
         Ok(Expr::Table { entries, line })
     }
 
-    fn array_literal(&mut self, line: usize) -> Result<Expr, String> {
-        let mut items = Vec::new();
-        while !self.check(&TokenKind::RBracket) && !self.is_at_end() {
-            items.push(self.expression()?);
-            if !self.match_token(&TokenKind::Comma) { break; }
+    fn table_pattern(&mut self) -> Result<Pattern, String> {
+        let mut entries = Vec::new();
+        if !self.check(&TokenKind::RBrace) {
+            loop {
+                let key = self.consume_identifier()?;
+                self.consume(&TokenKind::Colon, "Expected ':' in table pattern")?;
+                let pat = self.pattern()?;
+                entries.push((key, pat));
+                if !self.match_token(&TokenKind::Comma) { break; }
+            }
         }
-        self.consume(&TokenKind::RBracket, "Expected ']' after array items")?;
-        Ok(Expr::Array { items, line })
+        self.consume(&TokenKind::RBrace, "Expected '}' in table pattern")?;
+        Ok(Pattern::Table(entries))
+    }
+
+    fn array_pattern(&mut self) -> Result<Pattern, String> {
+        let mut patterns = Vec::new();
+        if !self.check(&TokenKind::RBracket) {
+            loop {
+                patterns.push(self.pattern()?);
+                if !self.match_token(&TokenKind::Comma) { break; }
+            }
+        }
+        self.consume(&TokenKind::RBracket, "Expected ']' in array pattern")?;
+        Ok(Pattern::Array(patterns))
     }
 
     fn intern(&mut self, s: &str) -> InternedString {
