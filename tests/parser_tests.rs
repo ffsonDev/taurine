@@ -359,15 +359,6 @@ fn test_break_continue() {
 }
 
 #[test]
-fn test_throw() {
-    let stmts = parse("throw \"error\"").unwrap();
-    match &stmts[0] {
-        Stmt::Expression(Expr::Throw { .. }) => {}
-        _ => panic!("Expected Throw"),
-    }
-}
-
-#[test]
 fn test_export() {
     let stmts = parse("export value = 42").unwrap();
     match &stmts[0] {

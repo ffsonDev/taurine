@@ -12,9 +12,6 @@ use taurine::formatter::Formatter;
 
 fn create_interner_with_builtins() -> StringInterner {
     let mut interner = StringInterner::new();
-    
-    // Pre-populate with built-in function names at their expected IDs
-    // These IDs must match the ones used in native_functions.rs
     interner.intern_with_id("print", 1);
     interner.intern_with_id("assert", 2);
     interner.intern_with_id("assert_eq", 3);
@@ -33,16 +30,16 @@ fn create_interner_with_builtins() -> StringInterner {
     interner.intern_with_id("io_exit", 19);
     interner.intern_with_id("io_sleep", 20);
     interner.intern_with_id("io_time", 21);
-    interner.intern_with_id("str_upper", 30);
-    interner.intern_with_id("str_lower", 31);
-    interner.intern_with_id("str_trim", 32);
-    interner.intern_with_id("str_substr", 33);
-    interner.intern_with_id("str_find", 34);
-    interner.intern_with_id("str_replace", 35);
-    interner.intern_with_id("str_replace_all", 36);
-    interner.intern_with_id("str_split", 37);
-    interner.intern_with_id("char", 38);
-    interner.intern_with_id("byte", 39);
+    interner.intern_with_id("io_strupper", 30);
+    interner.intern_with_id("io_strlower", 31);
+    interner.intern_with_id("io_strtrim", 32);
+    interner.intern_with_id("io_strsubstr", 33);
+    interner.intern_with_id("io_strfind", 34);
+    interner.intern_with_id("io_strreplace", 35);
+    interner.intern_with_id("io_strreplaceall", 36);
+    interner.intern_with_id("io_strsplit", 37);
+    interner.intern_with_id("io_char", 38);
+    interner.intern_with_id("io_byte", 39);
     interner.intern_with_id("io_arraypush", 40);
     interner.intern_with_id("io_arraypop", 41);
     interner.intern_with_id("io_arraylen", 42);
@@ -71,7 +68,6 @@ fn create_interner_with_builtins() -> StringInterner {
     interner.intern_with_id("regex_find_all", 93);
     interner.intern_with_id("async_sleep", 100);
     interner.intern_with_id("async_spawn", 101);
-    
     interner
 }
 

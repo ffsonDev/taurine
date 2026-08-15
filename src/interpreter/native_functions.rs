@@ -683,20 +683,15 @@ fn register_crypto_functions(global: &Rc<RefCell<crate::environment::Environment
     });
 
     reg!(global, 75, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
-        use std::time::{SystemTime, UNIX_EPOCH};
         let count = if args.is_empty() { 16 } else {
             match &args[0] {
                 Value::Number(n) => *n as usize,
                 _ => return Err("crypto_random_bytes() requires number".to_string())
             }
         };
-        let seed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64;
-        let mut bytes = Vec::with_capacity(count);
-        let mut s = seed;
-        for _ in 0..count {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
-            bytes.push((s >> 32) as u8);
-        }
+        let mut bytes = vec![0u8; count];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|e| format!("Random generation error: {e}"))?;
         Ok(Value::Array(Rc::new(RefCell::new(
             bytes.into_iter().map(|b| Value::Number(b as f64)).collect()
         ))))

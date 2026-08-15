@@ -1,4 +1,4 @@
-![Taurine Banner](assets/banner.png)
+![Taurine Banner](banner.png)
 # Taurine
 
 **Fast, embeddable scripting language implemented in Rust**

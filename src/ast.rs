@@ -97,6 +97,10 @@ pub enum Expr {
         expr: Box<Expr>,
         line: usize,
     },
+    Set {
+        items: Vec<Expr>,
+        line: usize,
+    },
     NullCoalesce {
         left: Box<Expr>,
         right: Box<Expr>,
@@ -138,16 +142,10 @@ pub enum Expr {
         method: InternedString,
         line: usize,
     },
-    Set {
-        items: Vec<Expr>,
-        line: usize,
-    },
-    // Async/Await
     Await {
         future: Box<Expr>,
         line: usize,
     },
-    // Generator yield
     Yield {
         value: Option<Box<Expr>>,
         line: usize,
@@ -239,6 +237,10 @@ pub enum Stmt {
         catch_body: Vec<Stmt>,
         line: usize,
     },
+    Throw {
+        value: Expr,
+        line: usize,
+    },
     Break,
     Continue,
     Class {
@@ -264,6 +266,12 @@ pub enum Stmt {
         name: InternedString,
         params: Vec<(InternedString, Option<Expr>)>,
         body: Vec<Stmt>,
+        line: usize,
+    },
+    Set {
+        object: Box<Expr>,
+        name: InternedString,
+        value: Expr,
         line: usize,
     },
 }

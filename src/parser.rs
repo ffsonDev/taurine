@@ -1,8 +1,19 @@
 use crate::lexer::{Token, TokenKind};
 use crate::ast::{Expr, Stmt, Program, Pattern, MatchArm};
 use crate::string_intern::{StringInterner, InternedString};
+use std::sync::OnceLock;
 
 const MAX_PARSER_RECURSION_DEPTH: usize = 500;
+
+static DUMMY_TOKEN: OnceLock<Token> = OnceLock::new();
+
+fn dummy_token() -> &'static Token {
+    DUMMY_TOKEN.get_or_init(|| Token {
+        kind: TokenKind::Nil,
+        lexeme: String::new(),
+        line: 0,
+    })
+}
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -28,6 +39,44 @@ impl Parser {
         Ok(Program { statements })
     }
 
+    fn destructure_array(&mut self, line: usize) -> Result<Stmt, String> {
+        self.consume(&TokenKind::LBracket, "Expected '[' in array destructuring")?;
+        let mut names = Vec::new();
+        if !self.check(&TokenKind::RBracket) {
+            loop {
+                let name = self.consume_identifier()?;
+                names.push(name);
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(&TokenKind::RBracket, "Expected ']' in array destructuring")?;
+        self.consume(&TokenKind::Equal, "Expected '=' in destructuring")?;
+        let initializer = self.expression()?;
+        self.match_token(&TokenKind::Semicolon);
+        Ok(Stmt::Destructure { names, initializer, line })
+    }
+
+    fn destructure_table(&mut self, line: usize) -> Result<Stmt, String> {
+        self.consume(&TokenKind::LBrace, "Expected '{' in table destructuring")?;
+        let mut names = Vec::new();
+        if !self.check(&TokenKind::RBrace) {
+            loop {
+                let name = self.consume_identifier()?;
+                names.push(name);
+                if !self.match_token(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.consume(&TokenKind::RBrace, "Expected '}' in table destructuring")?;
+        self.consume(&TokenKind::Equal, "Expected '=' in destructuring")?;
+        let initializer = self.expression()?;
+        self.match_token(&TokenKind::Semicolon);
+        Ok(Stmt::Destructure { names, initializer, line })
+    }
+
     fn declaration(&mut self) -> Result<Stmt, String> {
         let line = self.peek().line;
         if self.match_token(&TokenKind::Import) {
@@ -42,8 +91,29 @@ impl Parser {
         if self.match_token(&TokenKind::Async) {
             return self.async_declaration(line);
         }
-        if self.match_token(&TokenKind::Let) || self.match_token(&TokenKind::Const) {
-            return self.variable_declaration(line);
+        if self.match_token(&TokenKind::Const) {
+            let name = self.consume_identifier()?;
+            self.consume(&TokenKind::Equal, "Expected '=' after const declaration")?;
+            let initializer = Some(self.expression()?);
+            self.match_token(&TokenKind::Semicolon);
+            return Ok(Stmt::Declaration { name, initializer, line, is_const: true });
+        }
+        if self.match_token(&TokenKind::Let) {
+            if self.check(&TokenKind::LBracket) {
+                return self.destructure_array(line);
+            }
+            if self.check(&TokenKind::LBrace) {
+                return self.destructure_table(line);
+            }
+            let name = self.consume_identifier()?;
+            let is_const = false;
+            let initializer = if self.match_token(&TokenKind::Equal) {
+                Some(self.expression()?)
+            } else {
+                None
+            };
+            self.match_token(&TokenKind::Semicolon);
+            return Ok(Stmt::Declaration { name, initializer, line, is_const });
         }
         if self.match_token(&TokenKind::Function) {
             return self.function_declaration(line);
@@ -258,41 +328,48 @@ impl Parser {
         if self.match_token(&TokenKind::If) { return self.if_statement(line); }
         if self.match_token(&TokenKind::While) { return self.while_statement(line); }
         if self.match_token(&TokenKind::For) { return self.for_statement(line); }
-        if self.match_token(&TokenKind::Return) {
-            if self.check(&TokenKind::RBrace) || self.is_at_end() {
-                return Ok(Stmt::Return(None));
-            }
-            let first = self.expression()?;
-            if self.match_token(&TokenKind::Comma) {
-                let mut values = vec![first];
-                loop {
-                    values.push(self.expression()?);
-                    if !self.match_token(&TokenKind::Comma) { break; }
-                }
-                self.match_token(&TokenKind::Semicolon);
-                return Ok(Stmt::ReturnMulti(values));
-            }
-            self.match_token(&TokenKind::Semicolon);
-            return Ok(Stmt::Return(Some(first)));
-        }
-        if self.match_token(&TokenKind::Break) { self.match_token(&TokenKind::Semicolon); return Ok(Stmt::Break); }
-        if self.match_token(&TokenKind::Continue) { self.match_token(&TokenKind::Semicolon); return Ok(Stmt::Continue); }
-        if self.match_token(&TokenKind::Throw) {
-            let expr = self.expression()?;
-            return Ok(Stmt::Expression(Expr::Throw { expr: Box::new(expr), line }));
-        }
-        if self.match_token(&TokenKind::Yield) {
-            let value = if !self.check(&TokenKind::RBrace) && !self.is_at_end() && !self.check(&TokenKind::Semicolon) {
-                Some(Box::new(self.expression()?))
-            } else { None };
-            self.match_token(&TokenKind::Semicolon);
-            return Ok(Stmt::Expression(Expr::Yield { value, line }));
-        }
+        if self.match_token(&TokenKind::Return) { return self.return_statement(line); }
+        if self.match_token(&TokenKind::Break) { return Ok(Stmt::Break); }
+        if self.match_token(&TokenKind::Continue) { return Ok(Stmt::Continue); }
+        if self.match_token(&TokenKind::Throw) { return self.throw_statement(line); }
         if self.check(&TokenKind::LBrace) { return self.block().map(Stmt::Block); }
         if self.check(&TokenKind::Identifier) && self.current + 1 < self.tokens.len() && self.tokens[self.current + 1].kind == TokenKind::Equal {
             return self.assignment_statement(line);
         }
         self.expression_statement()
+    }
+    
+    fn expression_statement(&mut self) -> Result<Stmt, String> {
+            let line = self.peek().line;
+            let expr = self.expression()?;
+            if self.match_token(&TokenKind::Equal) {
+                let value = self.expression()?;
+                self.match_token(&TokenKind::Semicolon);
+                match expr {
+                    Expr::Get { object, name, .. } => {
+                        return Ok(Stmt::Set { object, name, value, line });
+                    }
+                    _ => return Err("Invalid assignment target".to_string()),
+                }
+            }
+            self.match_token(&TokenKind::Semicolon);
+            Ok(Stmt::Expression(expr))
+        }
+
+        fn return_statement(&mut self, _line: usize) -> Result<Stmt, String> {
+        if self.match_token(&TokenKind::Semicolon) || self.check(&TokenKind::RBrace) || self.is_at_end() {
+            return Ok(Stmt::Return(None));
+        }
+        let mut values = vec![self.expression()?];
+        while self.match_token(&TokenKind::Comma) {
+            values.push(self.expression()?);
+        }
+        self.match_token(&TokenKind::Semicolon);
+        if values.len() == 1 {
+            Ok(Stmt::Return(Some(values.remove(0))))
+        } else {
+            Ok(Stmt::ReturnMulti(values))
+        }
     }
 
     fn for_statement(&mut self, line: usize) -> Result<Stmt, String> {
@@ -345,6 +422,12 @@ impl Parser {
         Ok(Stmt::For { initializer, condition, increment, body, line })
     }
 
+    fn throw_statement(&mut self, line: usize) -> Result<Stmt, String> {
+        let value = self.expression()?;
+        self.match_token(&TokenKind::Semicolon);
+        Ok(Stmt::Throw { value, line })
+    }
+
     fn assignment_statement(&mut self, line: usize) -> Result<Stmt, String> {
         let name = self.consume_identifier()?;
         self.consume(&TokenKind::Equal, "Expected '=' after variable name")?;
@@ -381,12 +464,6 @@ impl Parser {
             statements.push(self.declaration()?);
         }
         Ok(statements)
-    }
-
-    fn expression_statement(&mut self) -> Result<Stmt, String> {
-        let expr = self.expression()?;
-        self.match_token(&TokenKind::Semicolon);
-        Ok(Stmt::Expression(expr))
     }
 
     fn expression(&mut self) -> Result<Expr, String> {
@@ -823,9 +900,23 @@ impl Parser {
 
     fn is_at_end(&self) -> bool { self.current >= self.tokens.len() }
 
-    fn peek(&self) -> &Token { &self.tokens[self.current] }
+    fn peek(&self) -> &Token {
+        match self.tokens.get(self.current) {
+            Some(t) => t,
+            None => dummy_token(),
+        }
+    }
 
-    fn previous(&self) -> &Token { &self.tokens[self.current - 1] }
+    fn previous(&self) -> &Token {
+        if self.current > 0 {
+            match self.tokens.get(self.current - 1) {
+                Some(t) => t,
+                None => dummy_token(),
+            }
+        } else {
+            dummy_token()
+        }
+    }
 
     fn consume(&mut self, kind: &TokenKind, message: &str) -> Result<(), String> {
         if self.match_token(kind) { return Ok(()); }

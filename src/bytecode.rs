@@ -377,6 +377,7 @@ impl Compiler {
                 }
                 instructions.push(Instruction::Line { line_num: line });
             }
+            Stmt::Throw { .. } => {}
             Stmt::Try { body, catch_var: _, catch_body, line } => {
                 for stmt in body {
                     self.compile_stmt(instructions, stmt);
@@ -386,6 +387,7 @@ impl Compiler {
                 }
                 instructions.push(Instruction::Line { line_num: line });
             }
+            Stmt::Set { .. } => {}
             Stmt::Break => { instructions.push(Instruction::Break); }
             Stmt::Continue => { instructions.push(Instruction::Continue); }
             Stmt::Class { name, superclass, methods, line } => {
@@ -575,13 +577,9 @@ impl Compiler {
                 instructions.push(Instruction::Super { method });
             }
             Expr::Set { items, line: _ } => {
-                instructions.push(Instruction::NewTable);
-                for (i, item) in items.into_iter().enumerate() {
+                for item in items {
                     self.compile_expr(instructions, item);
-                    let key = InternedString(i);
-                    instructions.push(Instruction::TableSet { key });
                 }
-                instructions.push(Instruction::Set);
             }
             // Async/await/yield - not yet supported in bytecode mode
             Expr::AsyncFunctionLiteral { .. } |

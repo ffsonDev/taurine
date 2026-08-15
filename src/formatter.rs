@@ -316,11 +316,8 @@ impl Formatter {
                 format!("function({params_str}) {{ ... }}")
             }
             Expr::Set { items, line: _ } => {
-                let items_str = items.iter()
-                    .map(|i| self.expr_to_string(i))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("set({{{items_str}}})")
+                let inner: Vec<String> = items.iter().map(|i| format!("{:?}", i)).collect();
+                format!("{{{}}}", inner.join(", "))
             }
             Expr::This { line: _ } => {
                 "this".to_string()

@@ -38,6 +38,14 @@ impl Environment {
         self.constants.borrow_mut().insert(name.id(), ());
     }
 
+    pub fn all_entries(&self) -> Vec<(usize, Value)> {
+        self.values.borrow().iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    pub fn define_raw(&mut self, id: usize, value: Value) {
+        self.values.borrow_mut().insert(id, value);
+    }
+
     pub fn is_const(&self, name_id: usize) -> bool {
         if self.constants.borrow().contains_key(&name_id) {
             return true;

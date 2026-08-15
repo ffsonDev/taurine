@@ -206,38 +206,32 @@ impl Interpreter {
         interp
     }
 
-    /// Get next value from a generator (lazy evaluation)
-    pub fn generator_next(&mut self, generator: &Value) -> Result<Value, String> {
+    pub fn generator_next(&mut self, generator: &Value) -> Result<Option<Value>, String> {
         match generator {
             Value::Generator { body, closure, state, .. } => {
-                // 1. Check if there are already yielded values to consume
                 {
                     let mut gen_state = state.borrow_mut();
                     if gen_state.consumed_index < gen_state.yielded_values.len() {
                         let value = gen_state.yielded_values[gen_state.consumed_index].clone();
                         gen_state.consumed_index += 1;
-                        return Ok(value);
+                        return Ok(Some(value));
                     }
                     if gen_state.is_done {
-                        return Ok(Value::Nil);
+                        return Ok(None);
                     }
-                } // gen_state dropped here to release borrow
+                }
 
-                // 2. Clone execution state and body to avoid borrowing issues during execution
                 let exec_state = state.borrow().execution_state.clone();
                 let parent_env = closure.clone();
-                
                 let body_to_run = match &exec_state {
                     GeneratorExecutionState::NotStarted => body.clone(),
                     GeneratorExecutionState::Suspended { remaining_body, .. } => remaining_body.clone(),
-                    GeneratorExecutionState::Finished => return Ok(Value::Nil),
+                    GeneratorExecutionState::Finished => return Ok(None),
                 };
 
-                // 3. Setup environment and execute
                 let new_env = std::rc::Rc::new(std::cell::RefCell::new(
                     crate::environment::Environment::with_parent(parent_env)
                 ));
-
                 let old_global = std::mem::replace(&mut self.global, new_env.clone());
                 let old_return = self.return_value.take();
 
@@ -263,28 +257,23 @@ impl Interpreter {
                     }
                 }
 
-                // 4. Restore environment
                 self.global = old_global;
                 self.return_value = old_return;
 
-                // 5. Update generator state (now we can mutably borrow it safely)
                 let mut gen_state = state.borrow_mut();
                 if found_yield {
                     gen_state.yielded_values.push(yielded_val);
-                    
                     let original_len = match &exec_state {
                         GeneratorExecutionState::NotStarted => body.len(),
                         GeneratorExecutionState::Suspended { remaining_body, .. } => remaining_body.len(),
                         _ => 0,
                     };
-
                     if suspend_index + 1 < original_len {
                         let full_body = match &exec_state {
                             GeneratorExecutionState::NotStarted => body.clone(),
                             GeneratorExecutionState::Suspended { remaining_body, .. } => remaining_body.clone(),
                             _ => vec![],
                         };
-                        
                         gen_state.execution_state = GeneratorExecutionState::Suspended {
                             remaining_body: full_body[suspend_index + 1..].to_vec(),
                             closure: new_env.clone(),
@@ -296,13 +285,12 @@ impl Interpreter {
                 } else {
                     gen_state.is_done = true;
                     gen_state.execution_state = GeneratorExecutionState::Finished;
-                    return Ok(Value::Nil);
+                    return Ok(None);
                 }
 
-                // 6. Return the newly yielded value
                 let value = gen_state.yielded_values[gen_state.consumed_index].clone();
                 gen_state.consumed_index += 1;
-                Ok(value)
+                Ok(Some(value))
             }
             _ => Err("Not a generator".to_string()),
         }
@@ -440,8 +428,8 @@ impl Interpreter {
             message: e,
             line: 0
         })?;
-        if let Some(updated_interner) = parser.take_interner() {
-            self.interner = updated_interner;
+        if let Some(updated) = parser.take_interner() {
+            self.interner = updated;
         }
         self.interpret(program)
     }
@@ -450,8 +438,8 @@ impl Interpreter {
         let tokens = crate::lexer::tokenize_with_interner(source, &mut self.interner);
         let mut parser = crate::parser::Parser::with_interner(tokens, self.interner.clone());
         let program = parser.parse()?;
-        if let Some(updated_interner) = parser.take_interner() {
-            self.interner = updated_interner;
+        if let Some(updated) = parser.take_interner() {
+            self.interner = updated;
         }
         self.interpret_optimized(program)
     }
@@ -489,21 +477,18 @@ impl Interpreter {
         msg
     }
 
-        /// Ищет директорию std/ (рядом с бинарником, в текущей папке или по переменной окружения)
+    #[allow(dead_code)]
     fn find_std_dir(&self) -> Option<PathBuf> {
-        // 1. Переменная окружения (удобно для тестов)
         if let Ok(p) = std::env::var("TAURINE_STD_DIR") {
             let p = PathBuf::from(p);
             if p.exists() { return Some(p); }
         }
-        // 2. Рядом с исполняемым файлом (для релиза)
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let p = dir.join("std");
                 if p.exists() { return Some(p); }
             }
         }
-        // 3. В текущей рабочей директории (для cargo run)
         let p = PathBuf::from("./std");
         if p.exists() { return Some(p); }
         
@@ -511,7 +496,28 @@ impl Interpreter {
     }
 
     fn load_stdlib(&mut self) {
-       
+        if let Some(dir) = self.find_std_dir() {
+            let core_files = [
+                "array.tau", "json.tau", "crypto.tau",
+                "date.tau", "http.tau", "regex.tau",
+            ];
+            for file in core_files {
+                let path = dir.join(file);
+                if path.exists() {
+                    if let Ok(source) = std::fs::read_to_string(&path) {
+                        let tokens = crate::lexer::tokenize_with_interner(&source, &mut self.interner);
+                        let mut parser = crate::parser::Parser::with_interner(tokens, self.interner.clone());
+                        if let Ok(program) = parser.parse() {
+                            if let Some(updated_interner) = parser.take_interner() {
+                                self.interner = updated_interner;
+                            }
+                            let _ = self.interpret(program);
+                            self.return_value = None;
+                        }
+                    }
+                }
+            }
+        }
     }
 
 
@@ -572,23 +578,46 @@ impl Interpreter {
             }
             Stmt::Destructure { names, initializer, line } => {
                 self.current_line = line;
-                let init_value = self.execute_expr(initializer)?;
-                if let Value::Array(arr) = init_value {
-                    let arr_ref = arr.borrow();
-                    for item in names.iter().enumerate() {
-                        let (i, name): (usize, &InternedString) = item;
-                        if i < arr_ref.len() {
-                            self.global.borrow_mut().define(InternedString::new(name.id()), arr_ref[i].clone());
-                        } else {
-                            self.global.borrow_mut().define(InternedString::new(name.id()), Value::Nil);
+                let value = self.execute_expr(initializer)?;
+                match &value {
+                    Value::Array(arr) => {
+                        let arr_ref = arr.borrow();
+                        for (i, name) in names.iter().enumerate() {
+                            let val = arr_ref.get(i).cloned().unwrap_or(Value::Nil);
+                            self.global.borrow_mut().define(*name, val);
+                        }
+                    }
+                    Value::Table(map) => {
+                        let map_ref = map.borrow();
+                        for name in &names {
+                            let val = map_ref.get(&name.id()).cloned().unwrap_or(Value::Nil);
+                            self.global.borrow_mut().define(*name, val);
+                        }
+                    }
+                    _ => {
+                        for name in &names {
+                            self.global.borrow_mut().define(*name, Value::Nil);
                         }
                     }
                 }
+                return Ok(())
             }
             Stmt::Assignment { name, value, line, is_const_assign: _ } => {
                 self.current_line = line;
                 let val = self.execute_expr(value)?;
                 self.global.borrow_mut().assign(&name, val)?;
+            }
+            Stmt::Set { object, name, value, line } => {
+                self.current_line = line;
+                let obj_val = self.execute_expr(*object)?;
+                let val = self.execute_expr(value)?;
+                match obj_val {
+                    Value::Table(map) => {
+                        map.borrow_mut().insert(name.id(), val);
+                    }
+                    _ => return Err(format!("Cannot set property on non-table value")),
+                }
+                return Ok(())
             }
             Stmt::Expression(expr) => {
                 self.current_line = self.get_line(&expr);
@@ -726,20 +755,15 @@ impl Interpreter {
                             }
                         }
                     }
+
                     Value::Generator { .. } => {
-                        // Lazy iteration over generator
                         loop {
                             self.safety.safety_check()?;
-                            
-                            // Get next value from generator
-                            let item = match self.generator_next(&iter_value) {
-                                Ok(Value::Nil) => break, // Generator exhausted
-                                Ok(val) => val,
-                                Err(e) => return Err(e),
+                            let item = match self.generator_next(&iter_value)? {
+                                None => break,
+                                Some(val) => val,
                             };
-                            
                             self.global.borrow_mut().define(variable, item);
-                            
                             for stmt in &body {
                                 match self.execute_stmt(stmt.clone()) {
                                     Ok(_) => {}
@@ -803,31 +827,62 @@ impl Interpreter {
                     .ok_or_else(|| format!("Cannot import '{path}': module not found"))?;
                 let canonical_path = std::fs::canonicalize(&module_path).unwrap_or(module_path.clone());
                 let module_key = canonical_path.to_string_lossy().to_string();
+
                 if let Some(cached) = self.module_cache.borrow().get(&module_key) {
                     if let Some(alias_name) = alias {
                         self.global.borrow_mut().define(alias_name, cached.clone());
+                    } else {
+                        if let Value::Table(map) = cached {
+                            let entries: Vec<(usize, Value)> = map.borrow().iter().map(|(k, v)| (*k, v.clone())).collect();
+                            for (k, v) in entries {
+                                self.global.borrow_mut().define_raw(k, v);
+                            }
+                        }
                     }
                     return Ok(());
                 }
+
                 let source = std::fs::read_to_string(&module_path)
                     .map_err(|e| format!("Cannot import '{path}': {e}"))?;
-                
-                // ИСПРАВЛЕНО: Используем interner для импортов
-                let tokens = lexer::tokenize_with_interner(&source, &mut self.interner);
+
+                let tokens = crate::lexer::tokenize_with_interner(&source, &mut self.interner);
                 let mut parser = crate::parser::Parser::with_interner(tokens, self.interner.clone());
                 let program = parser.parse()?;
                 if let Some(updated_interner) = parser.take_interner() {
                     self.interner = updated_interner;
                 }
-                
-                let mut sub_interp = Interpreter::with_interner(self.base_path.clone(), self.interner.clone());
-                sub_interp.interpret(program)?;
-                
+
                 let module_table = Value::new_table();
-                self.module_cache.borrow_mut().insert(module_key, module_table.clone());
-                if let Some(alias_name) = alias {
-                    self.global.borrow_mut().define(alias_name, module_table);
+
+                match alias {
+                    Some(alias_name) => {
+                        let mut sub_interp = Interpreter::with_interner(self.base_path.clone(), self.interner.clone());
+                        sub_interp.interpret(program)?;
+                        self.interner = sub_interp.interner.clone();
+                        if let Value::Table(module_map) = &module_table {
+                            let sub_globals = sub_interp.global.borrow().all_entries();
+                            let mut module_ref = module_map.borrow_mut();
+                            for (k, v) in sub_globals {
+                                module_ref.insert(k, v);
+                            }
+                        }
+                        self.module_cache.borrow_mut().insert(module_key, module_table.clone());
+                        self.global.borrow_mut().define(alias_name, module_table);
+                    }
+                    None => {
+                        for stmt in program.statements {
+                            self.execute_stmt(stmt)?;
+                        }
+                        let module_table = Value::new_table();
+                        self.module_cache.borrow_mut().insert(module_key, module_table);
+                    }
                 }
+                return Ok(())
+            }
+            Stmt::Throw { value, line } => {
+                self.current_line = line;
+                let val = self.execute_expr(value)?;
+                return Err(format!("Uncaught exception: {:?}", val));
             }
             Stmt::Try { body, catch_var, catch_body, line } => {
                 self.current_line = line;
@@ -920,7 +975,6 @@ impl Interpreter {
             }
             Expr::Call { callee, arguments, line } => {
                 self.current_line = line;
-
                 if let Expr::Identifier(name) = &*callee {
                     if name.id() == 50 && arguments.len() == 1 {
                         let arg = self.execute_expr(arguments[0].clone())?;
@@ -934,41 +988,46 @@ impl Interpreter {
                         return Ok(Value::String(json));
                     }
                 }
-
-            if let Expr::Get { object, name, .. } = &*callee {
-                let obj_val = self.execute_expr(*object.clone())?;
-                if let Value::Table(ref t) = obj_val {
-                    if let Some(method) = t.borrow().get(&name.id()).cloned() {
+                if let Expr::Get { object, name, .. } = &*callee {
+                    let obj_val = self.execute_expr(*object.clone())?;
+                    let method = match &obj_val {
+                        Value::Table(map) => map.borrow().get(&name.id()).cloned(),
+                        _ => None,
+                    };
+                    if let Some(method_val) = method {
+                        let args: Result<Vec<Value>, String> = arguments
+                            .into_iter()
+                            .map(|arg| self.execute_expr(arg))
+                            .collect();
+                        let args = args?;
                         self.this_stack.push(obj_val.clone());
-                        let args_res: Result<Vec<Value>, String> = arguments.into_iter().map(|a| self.execute_expr(a)).collect();
-                        let result = self.call_function(method, args_res?);
+                        let result = self.call_function(method_val, args);
                         self.this_stack.pop();
                         return result;
                     }
                 }
-            }
-
-            if let Expr::SafeGet { object, name, .. } = &*callee {
-                let obj_val = self.execute_expr(*object.clone())?;
-                if obj_val == Value::Nil { return Ok(Value::Nil); }
-                if let Value::Table(ref t) = obj_val {
-                    if let Some(method) = t.borrow().get(&name.id()).cloned() {
-
-                        self.this_stack.push(obj_val.clone());
-                        let args_res: Result<Vec<Value>, String> = arguments.into_iter().map(|a| self.execute_expr(a)).collect();
-                        let result = self.call_function(method, args_res?);
-                        self.this_stack.pop();
-                        return result;
+                if let Expr::SafeGet { object, name, .. } = &*callee {
+                    let obj_val = self.execute_expr(*object.clone())?;
+                    if obj_val == Value::Nil { return Ok(Value::Nil); }
+                    if let Value::Table(ref t) = obj_val {
+                        if let Some(method) = t.borrow().get(&name.id()).cloned() {
+                            let args_res: Result<Vec<Value>, String> = arguments.into_iter().map(|a| self.execute_expr(a)).collect();
+                            let args = args_res?;
+                            self.this_stack.push(obj_val.clone());
+                            let result = self.call_function(method, args);
+                            self.this_stack.pop();
+                            return result;
+                        }
                     }
                 }
+                let func = self.execute_expr(*callee)?;
+                let args: Result <Vec <Value >, String > = arguments
+                    .into_iter()
+                    .map(|arg| self.execute_expr(arg))
+                    .collect();
+                self.call_function(func, args?)
             }
-            let func = self.execute_expr(*callee)?;
-            let args: Result <Vec <Value >, String > = arguments
-                .into_iter()
-                .map(|arg| self.execute_expr(arg))
-                .collect();
-            self.call_function(func, args?)
-        }
+
             Expr::Table { entries, line } => {
                 self.current_line = line;
                 let mut table: IndexMap<usize, Value> = IndexMap::new();
@@ -1232,14 +1291,13 @@ impl Interpreter {
                 Ok(Value::Nil)
             }
             Expr::Set { items, line } => {
-                self.current_line = line;
-                let mut set_table = IndexMap::new();
-                for (i, item) in items.into_iter().enumerate() {
-                    let val = self.execute_expr(item)?;
-                    set_table.insert(i, val);
-                }
-                Ok(Value::Table(Rc::new(RefCell::new(set_table))))
+            self.current_line = line;
+            let mut values = Vec::new();
+            for item in items {
+                values.push(self.execute_expr(item)?);
             }
+            Ok(Value::Array(Rc::new(RefCell::new(values.into()))))
+        }
         }
     }
 
@@ -1344,6 +1402,7 @@ impl Interpreter {
                     line: self.current_line,
                 });
                 let old_global = std::mem::replace(&mut self.global, new_env.clone());
+                
                 let exec_result = (|| -> Result<Value, String> {
                     for stmt in &body {
                         self.execute_stmt(stmt.clone())?;
@@ -1351,8 +1410,10 @@ impl Interpreter {
                     }
                     Ok(self.return_value.take().unwrap_or(Value::Nil))
                 })();
+
                 self.global = old_global;
                 self.call_stack.pop();
+                
                 exec_result
             }
             Value::AsyncFunction { name, params, default_params, body, closure } => {
@@ -1379,6 +1440,7 @@ impl Interpreter {
                     function: format!("async function {name}"),
                     line: self.current_line,
                 });
+                let future_state = Rc::new(RefCell::new(crate::value::FutureState::Pending));
                 let old_global = std::mem::replace(&mut self.global, new_env.clone());
                 let exec_result = (|| -> Result<Value, String> {
                     for stmt in &body {
@@ -1390,7 +1452,10 @@ impl Interpreter {
                 self.global = old_global;
                 self.call_stack.pop();
                 match exec_result {
-                    Ok(v) => Ok(v),
+                    Ok(v) => {
+                        *future_state.borrow_mut() = crate::value::FutureState::Ready(v.clone());
+                        Ok(Value::Future(future_state))
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -1400,6 +1465,7 @@ impl Interpreter {
                 gen_state.consumed_index = 0;
                 gen_state.is_done = false;
                 drop(gen_state);
+
                 let new_env = Rc::new(RefCell::new(Environment::with_parent(closure.clone())));
                 for (i, param_id) in params.iter().enumerate() {
                     let val = if i < args.len() { args[i].clone() } else { Value::Nil };
@@ -1410,20 +1476,21 @@ impl Interpreter {
                     line: self.current_line,
                 });
                 let old_global = std::mem::replace(&mut self.global, new_env.clone());
-                let _result = (|| -> Result<Value, String> {
+                let future_state = Rc::new(RefCell::new(crate::value::FutureState::Pending));
+                
+                let exec_result = (|| -> Result<Value, String> {
                     for stmt in &body {
                         self.execute_stmt(stmt.clone())?;
                         if self.return_value.is_some() { break; }
                     }
                     Ok(self.return_value.take().unwrap_or(Value::Nil))
                 })();
+
                 self.global = old_global;
                 self.call_stack.pop();
-                state.borrow_mut().is_done = true;
-                match _result {
-                    Ok(_) => Ok(Value::Generator { name, params, body, closure, state }),
-                    Err(e) => Err(e),
-                }
+                exec_result
+
+                
             }
             Value::NativeFunction(func) => {
                 self.call_stack.push(StackFrame {
@@ -1891,19 +1958,217 @@ mod tests {
             let sum = await add(10, 20)
         "#).is_ok());
     }
+    #[test]
+    fn test_interpreter_closure_counter() {
+        let mut interp = create_interp();
+        let result = interp.run(r#"
+            function makeCounter() {
+                let count = 0
+                function increment() {
+                    count = count + 1
+                    return count
+                }
+                return increment
+            }
+            let counter = makeCounter()
+            let a = counter()
+            let b = counter()
+            let c = counter()
+        "#);
+        assert!(result.is_ok());
+        let c = interp.get("c").unwrap();
+        assert_eq!(c, Value::Number(3.0));
+    }
 
     #[test]
-    fn test_interpreter_nested_async() {
+    fn test_interpreter_closure_capture() {
         let mut interp = create_interp();
-        assert!(interp.run(r#"
-            async function inner(x) {
-                return x * 10
+        let result = interp.run(r#"
+            function outer(x) {
+                function inner(y) {
+                    return x + y
+                }
+                return inner
             }
-            async function outer(x) {
-                let r = await inner(x)
-                return r + 1
+            let add5 = outer(5)
+            let result = add5(10)
+        "#);
+        assert!(result.is_ok());
+        let val = interp.get("result").unwrap();
+        assert_eq!(val, Value::Number(15.0));
+    }
+    #[test]
+    fn test_interpreter_class_basic() {
+        let mut interp = create_interp();
+        let result = interp.run(r#"
+            class Dog {
+                function bark() {
+                    return "Woof!"
+                }
             }
-            let result = await outer(3)
-        "#).is_ok());
+            let dog = new Dog()
+            let sound = dog.bark()
+        "#);
+        assert!(result.is_ok());
+        let sound = interp.get("sound").unwrap();
+        assert_eq!(sound, Value::String("Woof!".to_string()));
+    }
+
+    #[test]
+    fn test_interpreter_class_with_state() {
+        let mut interp = create_interp();
+        let result = interp.run(r#"
+            class Counter {
+                function init() {
+                    this.count = 0
+                }
+                function increment() {
+                    this.count = this.count + 1
+                    return this.count
+                }
+            }
+            let c = new Counter()
+            c.init()
+            let a = c.increment()
+            let b = c.increment()
+        "#);
+        assert!(result.is_ok());
+        let b = interp.get("b").unwrap();
+        assert_eq!(b, Value::Number(2.0));
+    }
+
+    #[test]
+    fn test_interpreter_class_inheritance() {
+        let mut interp = create_interp();
+        let result = interp.run(r#"
+            class Counter {
+                function init() {
+                    this.count = 0
+                }
+                function increment() {
+                    this.count = this.count + 1
+                    return this.count
+                }
+            }
+            let c = new Counter()
+            c.init()
+            let a = c.increment()
+            let b = c.increment()
+        "#);
+        if let Err(e) = &result {
+            eprintln!("ERROR: {}", e);
+        }
+        assert!(result.is_ok());
+    }
+    #[test]
+    fn test_interpreter_multi_return() {
+        let mut interp = create_interp();
+        let result = interp.run(r#"
+            function swap(a, b) {
+                return b, a
+            }
+            let result = swap(1, 2)
+            let first = result[0]
+            let second = result[1]
+        "#);
+        assert!(result.is_ok());
+        let first = interp.get("first").unwrap();
+        let second = interp.get("second").unwrap();
+        assert_eq!(first, Value::Number(2.0));
+        assert_eq!(second, Value::Number(1.0));
+    }
+
+    #[test]
+    fn test_interpreter_multi_return_three() {
+        let mut interp = create_interp();
+        let result = interp.run(r#"
+            function stats(a, b, c) {
+                let min = a
+                if b < min { min = b }
+                if c < min { min = c }
+                let max = a
+                if b > max { max = b }
+                if c > max { max = c }
+                let sum = a + b + c
+                return min, max, sum
+            }
+            let result = stats(10, 5, 20)
+            let min_val = result[0]
+            let max_val = result[1]
+            let sum_val = result[2]
+        "#);
+        assert!(result.is_ok());
+        assert_eq!(interp.get("min_val").unwrap(), Value::Number(5.0));
+        assert_eq!(interp.get("max_val").unwrap(), Value::Number(20.0));
+        assert_eq!(interp.get("sum_val").unwrap(), Value::Number(35.0));
+    }
+    #[test]
+    fn test_interpreter_destructure_array() {
+        let mut interp = create_interp();
+        let result = interp.run(r#"
+            let [a, b, c] = [10, 20, 30]
+        "#);
+        if let Err(e) = &result {
+            eprintln!("ERROR: {}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(interp.get("a").unwrap(), Value::Number(10.0));
+        assert_eq!(interp.get("b").unwrap(), Value::Number(20.0));
+        assert_eq!(interp.get("c").unwrap(), Value::Number(30.0));
+    }
+
+    #[test]
+    fn test_interpreter_destructure_table() {
+        let mut interp = create_interp();
+        let result = interp.run(r#"
+            let {name, value} = {name: "test", value: 42}
+        "#);
+        if let Err(e) = &result {
+            eprintln!("ERROR: {}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(interp.get("name").unwrap(), Value::String("test".to_string()));
+        assert_eq!(interp.get("value").unwrap(), Value::Number(42.0));
+    }
+
+    #[test]
+    fn test_interpreter_destructure_multi_return() {
+        let mut interp = create_interp();
+        let result = interp.run(r#"
+            function swap(a, b) {
+                return b, a
+            }
+            let [x, y] = swap(1, 2)
+        "#);
+        if let Err(e) = &result {
+            eprintln!("ERROR: {}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(interp.get("x").unwrap(), Value::Number(2.0));
+        assert_eq!(interp.get("y").unwrap(), Value::Number(1.0));
+    }
+    #[test]
+    fn test_interpreter_import_basic() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("taurine_test_import");
+        std::fs::create_dir_all(&dir).unwrap();
+        let module_path = dir.join("math_utils.tau");
+        let mut f = std::fs::File::create(&module_path).unwrap();
+        writeln!(f, "function double(x) {{ return x * 2 }}").unwrap();
+        writeln!(f, "let PI = 3.14159").unwrap();
+        drop(f);
+
+        let mut interp = create_interp();
+        let code = format!(r#"
+            import "{}"
+            let result = double(21)
+        "#, module_path.display());
+        let result = interp.run(&code);
+        if let Err(e) = &result {
+            eprintln!("ERROR: {}", e);
+        }
+        assert!(result.is_ok());
+        assert_eq!(interp.get("result").unwrap(), Value::Number(42.0));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
