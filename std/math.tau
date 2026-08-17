@@ -4,8 +4,7 @@ let TAU = 6.283185307179586
 let SQRT2 = 1.414213562373095
 
 function abs(x) {
-    if x < 0 { return -x }
-    return x
+    return math_abs(x)
 }
 
 function sign(x) {
@@ -15,35 +14,11 @@ function sign(x) {
 }
 
 function floor(x) {
-    if x >= 0 {
-        let i = 0
-        while i + 1 <= x {
-            i = i + 1
-        }
-        return i
-    } else {
-        let i = 0
-        while i - 1 > x {
-            i = i - 1
-        }
-        return i - 1
-    }
+    return math_floor(x)
 }
 
 function ceil(x) {
-    if x >= 0 {
-        let i = 0
-        while i < x {
-            i = i + 1
-        }
-        return i
-    } else {
-        let i = 0
-        while i > x {
-            i = i - 1
-        }
-        return i
-    }
+    return math_ceil(x)
 }
 
 function round(x) {
@@ -67,15 +42,7 @@ function max(a, b) {
 }
 
 function sqrt(x) {
-    if x < 0 { throw "sqrt() requires non-negative number" }
-    if x == 0 { return 0 }
-    let guess = x / 2
-    let i = 0
-    while i < 100 {
-        guess = (guess + x / guess) / 2
-        i = i + 1
-    }
-    return guess
+    return math_sqrt(x)
 }
 
 function pow(base, exp) {

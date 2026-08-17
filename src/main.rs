@@ -261,13 +261,18 @@ fn run_source(source: &str, filename: &str, base_path: PathBuf, debug: bool, opt
         Ok(_) => {
             let exec_time = exec_start.elapsed();
             if debug {
-                println!("\nSuccess!");
+                println!("Success!");
                 println!("Execution time: {:.4} seconds ({:.2} ms)",
                     exec_time.as_secs_f64(),
                     exec_time.as_secs_f64() * 1000.0);
             }
         }
         Err(e) => {
+            if e.message().starts_with("__EXIT__:") {
+                let code_str = e.message().trim_start_matches("__EXIT__:");
+                let code: i32 = code_str.parse().unwrap_or(0);
+                std::process::exit(code);
+            }
             eprintln!("error: {}", e.message());
             if e.line() > 0 {
                 eprintln!("line {}", e.line());

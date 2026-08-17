@@ -17,43 +17,35 @@ fn sanitize_path(user_path: &str) -> Result<PathBuf, String> {
     sanitize_path_with_absolute(user_path, true)
 }
 
-fn sanitize_path_sandbox(user_path: &str) -> Result<PathBuf, String> {
-    sanitize_path_inner(user_path, false)
-}
-
-fn sanitize_path_inner(user_path: &str, allow_absolute: bool) -> Result<PathBuf, String> {
-    let full_path = Path::new(user_path);
-    let canonical = full_path.canonicalize()
-        .map_err(|e| format!("Invalid path: {e}"))?;
-    let current_dir = std::env::current_dir()
-        .map_err(|e| format!("Cannot get current directory: {e}"))?;
-    if user_path.starts_with('/') || user_path.chars().nth(1) == Some(':') {
-        if !allow_absolute {
-            return Err("Absolute paths are not allowed in sandbox mode".to_string());
-        }
-        return Ok(canonical);
-    }
-    if !canonical.starts_with(&current_dir) {
-        return Err("Path traversal detected: access outside current directory is not allowed".to_string());
-    }
-    Ok(canonical)
-}
-
 fn sanitize_path_with_absolute(user_path: &str, allow_absolute: bool) -> Result<PathBuf, String> {
     let full_path = Path::new(user_path);
-    let canonical = full_path.canonicalize()
-        .map_err(|e| format!("Invalid path: {e}"))?;
-    let current_dir = std::env::current_dir()
-        .map_err(|e| format!("Cannot get current directory: {e}"))?;
-    if user_path.starts_with('/') || user_path.chars().nth(1) == Some(':') {
+
+    if full_path.is_absolute() {
         if !allow_absolute {
             return Err("Absolute paths are not allowed in sandbox mode".to_string());
         }
+        let canonical = full_path.canonicalize()
+            .map_err(|e| format!("Invalid path: {e}"))?;
         return Ok(canonical);
     }
+
+    for component in full_path.components() {
+        if let std::path::Component::ParentDir = component {
+            return Err("Path traversal detected".to_string());
+        }
+    }
+
+    let current_dir = std::env::current_dir()
+        .map_err(|e| format!("Cannot get current directory: {e}"))?;
+
+    let resolved = current_dir.join(full_path);
+    let canonical = resolved.canonicalize()
+        .map_err(|e| format!("Invalid path: {e}"))?;
+
     if !canonical.starts_with(&current_dir) {
         return Err("Path traversal detected: access outside current directory is not allowed".to_string());
     }
+
     Ok(canonical)
 }
 
@@ -257,7 +249,7 @@ fn register_io_functions(global: &Rc<RefCell<crate::environment::Environment>>) 
                 _ => 0
             }
         };
-        std::process::exit(code);
+        Err(format!("__EXIT__:{code}"))
     });
 
     reg!(global, 20, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
@@ -581,10 +573,69 @@ fn get_http_client() -> &'static reqwest::blocking::Client {
     })
 }
 
+fn validate_http_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| format!("Invalid URL: {e}"))?;
+
+    match parsed.scheme() {
+        "http" | "https" => {},
+        _ => return Err(format!("Scheme '{}' is not allowed", parsed.scheme())),
+    }
+
+    if let Some(host) = parsed.host_str() {
+        if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+            return Err("Access to localhost is not allowed".to_string());
+        }
+        if host.starts_with("10.") ||
+           host.starts_with("192.168.") ||
+           host.starts_with("172.16.") ||
+           host.starts_with("169.254.") {
+            return Err("Access to private networks is not allowed".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+fn register_math_functions(global: &Rc<RefCell<crate::environment::Environment>>) {
+    reg!(global, 110, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
+        if args.is_empty() { return Err("math_floor() requires 1 argument".to_string()); }
+        match &args[0] {
+            Value::Number(n) => Ok(Value::Number(n.floor())),
+            _ => Err("math_floor() requires number".to_string())
+        }
+    });
+    reg!(global, 111, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
+        if args.is_empty() { return Err("math_ceil() requires 1 argument".to_string()); }
+        match &args[0] {
+            Value::Number(n) => Ok(Value::Number(n.ceil())),
+            _ => Err("math_ceil() requires number".to_string())
+        }
+    });
+    reg!(global, 112, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
+        if args.is_empty() { return Err("math_sqrt() requires 1 argument".to_string()); }
+        match &args[0] {
+            Value::Number(n) => {
+                if *n < 0.0 { return Err("math_sqrt() requires non-negative number".to_string()); }
+                Ok(Value::Number(n.sqrt()))
+            }
+            _ => Err("math_sqrt() requires number".to_string())
+        }
+    });
+    reg!(global, 113, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
+        if args.is_empty() { return Err("math_abs() requires 1 argument".to_string()); }
+        match &args[0] {
+            Value::Number(n) => Ok(Value::Number(n.abs())),
+            _ => Err("math_abs() requires number".to_string())
+        }
+    });
+}
+
 fn register_http_functions(global: &Rc<RefCell<crate::environment::Environment>>) {
     reg!(global, 60, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
         if args.is_empty() { return Err("http_get() requires 1 argument".to_string()); }
         if let Value::String(url) = &args[0] {
+            validate_http_url(url)?;
             let client = get_http_client();
             let response = client.get(url.as_str())
                 .send()
@@ -607,6 +658,7 @@ fn register_http_functions(global: &Rc<RefCell<crate::environment::Environment>>
     reg!(global, 61, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
         if args.len() < 2 { return Err("http_post() requires 2 arguments".to_string()); }
         if let (Value::String(url), Value::String(data)) = (&args[0], &args[1]) {
+            validate_http_url(url)?;
             let client = get_http_client();
             let response = client.post(url.as_str())
                 .body(data.clone())
@@ -625,6 +677,7 @@ fn register_http_functions(global: &Rc<RefCell<crate::environment::Environment>>
     reg!(global, 62, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
         if args.len() < 2 { return Err("http_put() requires 2 arguments".to_string()); }
         if let (Value::String(url), Value::String(data)) = (&args[0], &args[1]) {
+            validate_http_url(url)?;
             let client = get_http_client();
             let response = client.put(url.as_str())
                 .body(data.clone())
@@ -643,6 +696,7 @@ fn register_http_functions(global: &Rc<RefCell<crate::environment::Environment>>
     reg!(global, 63, |args: &[Value], _int: &mut crate::string_intern::StringInterner| {
         if args.is_empty() { return Err("http_delete() requires 1 argument".to_string()); }
         if let Value::String(url) = &args[0] {
+            validate_http_url(url)?;
             let client = get_http_client();
             let response = client.delete(url.as_str())
                 .send()

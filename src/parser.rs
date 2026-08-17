@@ -407,6 +407,7 @@ impl Parser {
                     _ => return Err("Invalid assignment target".to_string()),
                 }
             }
+            self.recursion_depth -= 1;
             self.match_token(&TokenKind::Semicolon);
             Ok(Stmt::Expression(expr))
         }
@@ -526,36 +527,55 @@ impl Parser {
     }
 
     fn null_coalesce_expr(&mut self) -> Result<Expr, String> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(format!("Parser recursion depth limit exceeded (max: {})", MAX_PARSER_RECURSION_DEPTH));
+        }
+        self.recursion_depth += 1;
         let line = self.peek().line;
         let mut left = self.or_expr()?;
         while self.match_token(&TokenKind::NullCoalesce) {
             let right = self.or_expr()?;
             left = Expr::NullCoalesce { left: Box::new(left), right: Box::new(right), line };
         }
+        self.recursion_depth -= 1;
         Ok(left)
     }
 
     fn or_expr(&mut self) -> Result<Expr, String> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(format!("Parser recursion depth limit exceeded (max: {})", MAX_PARSER_RECURSION_DEPTH));
+        }
+        self.recursion_depth += 1;
         let line = self.peek().line;
         let mut left = self.and_expr()?;
         while self.match_token(&TokenKind::Or) {
             let right = self.and_expr()?;
             left = Expr::Binary { left: Box::new(left), op: TokenKind::Or, right: Box::new(right), line };
         }
+        self.recursion_depth -= 1;
         Ok(left)
     }
 
     fn and_expr(&mut self) -> Result<Expr, String> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(format!("Parser recursion depth limit exceeded (max: {})", MAX_PARSER_RECURSION_DEPTH));
+        }
+        self.recursion_depth += 1;
         let line = self.peek().line;
         let mut left = self.equality()?;
         while self.match_token(&TokenKind::And) {
             let right = self.equality()?;
             left = Expr::Binary { left: Box::new(left), op: TokenKind::And, right: Box::new(right), line };
         }
+        self.recursion_depth -= 1;
         Ok(left)
     }
 
     fn equality(&mut self) -> Result<Expr, String> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(format!("Parser recursion depth limit exceeded (max: {})", MAX_PARSER_RECURSION_DEPTH));
+        }
+        self.recursion_depth += 1;
         let line = self.peek().line;
         let mut left = self.comparison()?;
         while self.match_token(&TokenKind::EqualEqual) || self.match_token(&TokenKind::NotEqual) {
@@ -563,10 +583,15 @@ impl Parser {
             let right = self.comparison()?;
             left = Expr::Binary { left: Box::new(left), op, right: Box::new(right), line };
         }
+        self.recursion_depth -= 1;
         Ok(left)
     }
 
     fn comparison(&mut self) -> Result<Expr, String> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(format!("Parser recursion depth limit exceeded (max: {})", MAX_PARSER_RECURSION_DEPTH));
+        }
+        self.recursion_depth += 1;
         let line = self.peek().line;
         let mut left = self.term()?;
         while self.match_token(&TokenKind::Less) || self.match_token(&TokenKind::Greater) || self.match_token(&TokenKind::LessEqual) || self.match_token(&TokenKind::GreaterEqual) {
@@ -574,10 +599,15 @@ impl Parser {
             let right = self.term()?;
             left = Expr::Binary { left: Box::new(left), op, right: Box::new(right), line };
         }
+        self.recursion_depth -= 1;
         Ok(left)
     }
 
     fn term(&mut self) -> Result<Expr, String> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(format!("Parser recursion depth limit exceeded (max: {})", MAX_PARSER_RECURSION_DEPTH));
+        }
+        self.recursion_depth += 1;
         let line = self.peek().line;
         let mut left = self.factor()?;
         while self.match_token(&TokenKind::Plus) || self.match_token(&TokenKind::Minus) {
@@ -585,10 +615,15 @@ impl Parser {
             let right = self.factor()?;
             left = Expr::Binary { left: Box::new(left), op, right: Box::new(right), line };
         }
+        self.recursion_depth -= 1;
         Ok(left)
     }
 
     fn factor(&mut self) -> Result<Expr, String> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(format!("Parser recursion depth limit exceeded (max: {})", MAX_PARSER_RECURSION_DEPTH));
+        }
+        self.recursion_depth += 1;
         let line = self.peek().line;
         let mut left = self.unary()?;
         while self.match_token(&TokenKind::Star) || self.match_token(&TokenKind::Slash) || self.match_token(&TokenKind::Percent) {
@@ -600,6 +635,7 @@ impl Parser {
             let right = self.unary()?;
             return Ok(Expr::Range { start: Box::new(left), end: Box::new(right), line });
         }
+        self.recursion_depth -= 1;
         Ok(left)
     }
 
@@ -631,6 +667,10 @@ impl Parser {
     }
 
     fn call(&mut self) -> Result<Expr, String> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(format!("Parser recursion depth limit exceeded (max: {})", MAX_PARSER_RECURSION_DEPTH));
+        }
+        self.recursion_depth += 1;
         let line = self.peek().line;
         let mut expr = self.primary()?;
         loop {
@@ -679,6 +719,7 @@ impl Parser {
                 break;
             }
         }
+        self.recursion_depth -= 1;
         Ok(expr)
     }
 
@@ -705,6 +746,10 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(format!("Parser recursion depth limit exceeded (max: {})", MAX_PARSER_RECURSION_DEPTH));
+        }
+        self.recursion_depth += 1;
         let line = self.peek().line;
         if self.match_token(&TokenKind::True) { return Ok(Expr::LiteralTrue); }
         if self.match_token(&TokenKind::False) { return Ok(Expr::LiteralFalse); }
@@ -738,6 +783,7 @@ impl Parser {
                     result.push(c);
                 }
             }
+            self.recursion_depth -= 1;
             return Ok(Expr::String(result));
         }
         if self.match_token(&TokenKind::Await) {

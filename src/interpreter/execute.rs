@@ -99,6 +99,7 @@ pub struct Interpreter {
     pub(crate) interner: crate::string_intern::StringInterner,
     call_depth: usize,
     this_stack: Vec<Value>,
+    start_time: std::time::Instant,
 }
 
 fn create_default_interner() -> crate::string_intern::StringInterner {
@@ -159,6 +160,10 @@ fn create_default_interner() -> crate::string_intern::StringInterner {
     interner.intern_with_id("regex_find_all", 93);
     interner.intern_with_id("async_sleep", 100);
     interner.intern_with_id("async_spawn", 101);
+    interner.intern_with_id("math_floor", 110);
+    interner.intern_with_id("math_ceil", 111);
+    interner.intern_with_id("math_sqrt", 112);
+    interner.intern_with_id("math_abs", 113);
     interner
 }
 
@@ -201,10 +206,20 @@ impl Interpreter {
             gc,
             call_depth: 0,
             this_stack: Vec::new(),
+            start_time: std::time::Instant::now(),
         };
         register_builtins(&interp.global);
         interp.load_stdlib();
         interp
+    }
+
+    fn safety_check_with_time(&self) -> Result<(), String> {
+        if let Some(timeout) = self.safety.limits().timeout {
+            if self.start_time.elapsed() > timeout {
+                return Err("Execution timeout exceeded".to_string());
+            }
+        }
+        self.safety.safety_check()
     }
 
     pub fn generator_next(&mut self, generator: &Value) -> Result<Option<Value>, String> {
@@ -405,16 +420,18 @@ impl Interpreter {
     pub fn interpret(&mut self, program: Program) -> Result<(), crate::error::TaurineError> {
         self.safety.reset();
         for stmt in program.statements {
-            self.safety.safety_check().map_err(|e| crate::error::TaurineError::Runtime { 
-                message: e, 
-                line: self.current_line 
+            self.safety.safety_check().map_err(|e| crate::error::TaurineError::Runtime {
+                message: e,
+                line: self.current_line
             })?;
-            
             if let Err(e) = self.execute_stmt(stmt) {
+                if e.starts_with("__EXIT__:") {
+                    return Ok(());
+                }
                 let formatted_msg = self.format_error_with_traceback(&e);
-                return Err(crate::error::TaurineError::Runtime { 
-                    message: formatted_msg, 
-                    line: self.current_line 
+                return Err(crate::error::TaurineError::Runtime {
+                    message: formatted_msg,
+                    line: self.current_line
                 });
             }
         }
@@ -573,7 +590,7 @@ impl Interpreter {
     }
 
     fn execute_stmt(&mut self, stmt: Stmt) -> Result<(), String> {
-        self.safety.safety_check()?;
+        self.safety_check_with_time()?;
 
         match stmt {
             Stmt::Declaration { name, initializer, line, is_const } => {
@@ -956,7 +973,7 @@ impl Interpreter {
     }
 
     fn execute_expr(&mut self, expr: Expr) -> Result<Value, String> {
-        self.safety.safety_check()?;
+        self.safety_check_with_time()?;
 
         match expr {
             Expr::Number(n) => Ok(Value::Number(n)),
@@ -1022,20 +1039,19 @@ impl Interpreter {
                 }
                 if let Expr::Get { object, name, .. } = &*callee {
                     let obj_val = self.execute_expr(*object.clone())?;
-                    let method = match &obj_val {
-                        Value::Table(map) => map.borrow().get(&name.id()).cloned(),
-                        _ => None,
-                    };
-                    if let Some(method_val) = method {
-                        let args: Result<Vec<Value>, String> = arguments
-                            .into_iter()
-                            .map(|arg| self.execute_expr(arg))
-                            .collect();
-                        let args = args?;
-                        self.this_stack.push(obj_val.clone());
-                        let result = self.call_function(method_val, args);
-                        self.this_stack.pop();
-                        return result;
+                    if let Value::Table(ref t) = obj_val {
+                        if let Some(method) = t.borrow().get(&name.id()).cloned() {
+                            if let Some(func_name) = self.interner.get(name.id()) {
+                                if !self.security.is_function_allowed(func_name) {
+                                    return Err(format!("Function '{}' is blocked by security policy", func_name));
+                                }
+                            }
+                            self.this_stack.push(obj_val.clone());
+                            let args_res: Result<Vec<Value>, String> = arguments.into_iter().map(|a| self.execute_expr(a)).collect();
+                            let result = self.call_function(method, args_res?);
+                            self.this_stack.pop();
+                            return result;
+                        }
                     }
                 }
                 if let Expr::SafeGet { object, name, .. } = &*callee {
@@ -1043,10 +1059,14 @@ impl Interpreter {
                     if obj_val == Value::Nil { return Ok(Value::Nil); }
                     if let Value::Table(ref t) = obj_val {
                         if let Some(method) = t.borrow().get(&name.id()).cloned() {
-                            let args_res: Result<Vec<Value>, String> = arguments.into_iter().map(|a| self.execute_expr(a)).collect();
-                            let args = args_res?;
+                            if let Some(func_name) = self.interner.get(name.id()) {
+                                if !self.security.is_function_allowed(func_name) {
+                                    return Err(format!("Function '{}' is blocked by security policy", func_name));
+                                }
+                            }
                             self.this_stack.push(obj_val.clone());
-                            let result = self.call_function(method, args);
+                            let args_res: Result<Vec<Value>, String> = arguments.into_iter().map(|a| self.execute_expr(a)).collect();
+                            let result = self.call_function(method, args_res?);
                             self.this_stack.pop();
                             return result;
                         }
@@ -1551,38 +1571,6 @@ impl Interpreter {
                 }
 
                 Ok(Value::Generator { name, params, body, closure: new_env, state })
-            }
-            Value::Generator { name, params, body, closure, state } => {
-                let mut gen_state = state.borrow_mut();
-                gen_state.yielded_values.clear();
-                gen_state.consumed_index = 0;
-                gen_state.is_done = false;
-                drop(gen_state);
-
-                let new_env = Rc::new(RefCell::new(Environment::with_parent(closure.clone())));
-                for (i, param_id) in params.iter().enumerate() {
-                    let val = if i < args.len() { args[i].clone() } else { Value::Nil };
-                    new_env.borrow_mut().define(InternedString::new(*param_id), val);
-                }
-                self.call_stack.push(StackFrame {
-                    function: format!("generator {name}"),
-                    line: self.current_line,
-                });
-                let old_global = std::mem::replace(&mut self.global, new_env.clone());
-                
-                let exec_result = (|| -> Result<Value, String> {
-                    for stmt in &body {
-                        self.execute_stmt(stmt.clone())?;
-                        if self.return_value.is_some() { break; }
-                    }
-                    Ok(self.return_value.take().unwrap_or(Value::Nil))
-                })();
-
-                self.global = old_global;
-                self.call_stack.pop();
-                exec_result
-
-                
             }
             Value::NativeFunction(func) => {
                 self.call_stack.push(StackFrame {
