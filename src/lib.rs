@@ -32,7 +32,7 @@ pub use formatter::Formatter;
 pub use error::TaurineError;
 pub use safety::{SafetyLimits, SafetyContext, SecurityLevel, Permissions, SecurityError, ResourceTracker, InputValidator};
 pub use string_intern::{StringInterner, InternedString};
-pub use bytecode::{Compiler, VirtualMachine, BytecodeProgram, OpCode, Instruction};
+pub use bytecode::{Compiler, VirtualMachine, BytecodeProgram, BytecodeFunction, OpCode, Instruction};
 pub use arena::AstArena;
 pub use gc::{GcStrategy, GarbageCollector, GcStats, GcPtr, GcConfig};
 pub use benchmark::{BenchmarkResult, run_all_benchmarks};

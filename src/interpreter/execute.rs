@@ -682,6 +682,9 @@ impl Interpreter {
                             Ok(_) => {}
                             Err(e) => return Err(e),
                         }
+                        if self.return_value.is_some() {
+                            return Ok(());
+                        }
                         if self.control_flow == ControlFlow::Break {
                             self.control_flow = ControlFlow::None;
                             return Ok(());
@@ -708,6 +711,9 @@ impl Interpreter {
                         match self.execute_stmt(stmt.clone()) {
                             Ok(_) => {}
                             Err(e) => return Err(e),
+                        }
+                        if self.return_value.is_some() {
+                            return Ok(());
                         }
                         if self.control_flow == ControlFlow::Break {
                             self.control_flow = ControlFlow::None;
@@ -736,6 +742,9 @@ impl Interpreter {
                                     Ok(_) => {}
                                     Err(e) => return Err(e),
                                 }
+                                if self.return_value.is_some() {
+                                    return Ok(());
+                                }
                                 if self.control_flow == ControlFlow::Break {
                                     self.control_flow = ControlFlow::None;
                                     return Ok(());
@@ -757,30 +766,8 @@ impl Interpreter {
                                     Ok(_) => {}
                                     Err(e) => return Err(e),
                                 }
-                                if self.control_flow == ControlFlow::Break {
-                                    self.control_flow = ControlFlow::None;
+                                if self.return_value.is_some() {
                                     return Ok(());
-                                }
-                                if self.control_flow == ControlFlow::Continue {
-                                    self.control_flow = ControlFlow::None;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    Value::Generator { .. } => {
-                        loop {
-                            self.safety.safety_check()?;
-                            let item = match self.generator_next(&iter_value)? {
-                                None => break,
-                                Some(val) => val,
-                            };
-                            self.global.borrow_mut().define(variable, item);
-                            for stmt in &body {
-                                match self.execute_stmt(stmt.clone()) {
-                                    Ok(_) => {}
-                                    Err(e) => return Err(e),
                                 }
                                 if self.control_flow == ControlFlow::Break {
                                     self.control_flow = ControlFlow::None;
@@ -925,10 +912,17 @@ impl Interpreter {
             Stmt::Class { name, superclass, methods, line } => {
                 self.current_line = line;
                 let mut class_table: IndexMap<usize, Value> = IndexMap::new();
+
+                if let Some(ref super_name) = superclass {
+                    if let Ok(super_class) = self.global.borrow().get(super_name) {
+                        let super_key = self.interner.intern("__superclass__");
+                        class_table.insert(super_key, super_class);
+                    }
+                }
+
                 for method_item in methods {
                     let (member_name, member_expr): (InternedString, Expr) = method_item;
                     if let Expr::FunctionLiteral { params, body, .. } = member_expr {
-                        // Это метод
                         let method = Value::Function {
                             name: member_name.id(),
                             params: params.iter().map(|(p, _): &(InternedString, Option<Expr>)| p.id()).collect(),
@@ -938,14 +932,12 @@ impl Interpreter {
                         };
                         class_table.insert(member_name.id(), method);
                     } else {
-                        // Это поле класса (например, width = 10)
                         let val = self.execute_expr(member_expr)?;
                         class_table.insert(member_name.id(), val);
                     }
                 }
                 let class_value = Value::Table(Rc::new(RefCell::new(class_table)));
                 self.global.borrow_mut().define(name, class_value);
-                let _ = superclass;
             }
             Stmt::Export { name, value, line } => {
                 self.current_line = line;
@@ -1005,6 +997,28 @@ impl Interpreter {
                         let json = self.json_stringify(&arg)?;
                         return Ok(Value::String(json));
                     }
+                }
+                if let Expr::Super { method, line } = &*callee {
+                    let this = self.this_stack.last().cloned().unwrap_or(Value::Nil);
+                    let super_key = self.interner.intern("__superclass__");
+                    let superclass = match &this {
+                        Value::Table(t) => t.borrow().get(&super_key).cloned(),
+                        _ => None,
+                    };
+                    if let Some(Value::Table(super_t)) = superclass {
+                        if let Some(method_val) = super_t.borrow().get(&method.id()).cloned() {
+                            let args: Result<Vec<Value>, String> = arguments
+                                .into_iter()
+                                .map(|arg| self.execute_expr(arg))
+                                .collect();
+                            let args = args?;
+                            self.this_stack.push(this.clone());
+                            let result = self.call_function(method_val, args);
+                            self.this_stack.pop();
+                            return result;
+                        }
+                    }
+                    return Err(format!("Super method not found"));
                 }
                 if let Expr::Get { object, name, .. } = &*callee {
                     let obj_val = self.execute_expr(*object.clone())?;
@@ -1167,10 +1181,37 @@ impl Interpreter {
                 let future_val = self.execute_expr(*future)?;
                 match &future_val {
                     Value::Future(state) => {
-                        let state_ref = state.borrow();
-                        match &*state_ref {
-                            crate::value::FutureState::Ready(v) => Ok(v.clone()),
-                            crate::value::FutureState::Pending => Ok(Value::Nil),
+                        let deferred_data = {
+                            let state_ref = state.borrow();
+                            match &*state_ref {
+                                crate::value::FutureState::Ready(v) => return Ok(v.clone()),
+                                crate::value::FutureState::Pending => return Ok(Value::Nil),
+                                crate::value::FutureState::Deferred { body, closure, .. } => {
+                                    Some((body.clone(), closure.clone()))
+                                }
+                            }
+                        };
+
+                        if let Some((body, closure)) = deferred_data {
+                            let old_global = std::mem::replace(&mut self.global, closure);
+                            let result = (|| -> Result<Value, String> {
+                                for stmt in &body {
+                                    self.execute_stmt(stmt.clone())?;
+                                    if self.return_value.is_some() { break; }
+                                }
+                                Ok(self.return_value.take().unwrap_or(Value::Nil))
+                            })();
+                            self.global = old_global;
+
+                            match result {
+                                Ok(v) => {
+                                    *state.borrow_mut() = crate::value::FutureState::Ready(v.clone());
+                                    Ok(v)
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            Ok(Value::Nil)
                         }
                     }
                     _ => Ok(future_val),
@@ -1204,6 +1245,13 @@ impl Interpreter {
                 let match_val = self.execute_expr(*value)?;
                 for arm in arms {
                     if self.pattern_matches(&arm.pattern, &match_val)? {
+                        if let Some(ref guard) = arm.guard {
+                            let guard_val = self.execute_expr(guard.clone())?;
+                            if !guard_val.is_truthy() {
+                                continue;
+                            }
+                        }
+                        self.bind_pattern(&arm.pattern, &match_val)?;
                         return self.execute_expr(arm.body);
                     }
                 }
@@ -1260,6 +1308,14 @@ impl Interpreter {
             Expr::Class { name: _, superclass, methods, line } => {
                 self.current_line = line;
                 let mut class_table: IndexMap<usize, Value> = IndexMap::new();
+
+                if let Some(ref super_name) = superclass {
+                    if let Ok(super_class) = self.global.borrow().get(super_name) {
+                        let super_key = self.interner.intern("__superclass__");
+                        class_table.insert(super_key, super_class);
+                    }
+                }
+
                 for method_item in methods {
                     let (member_name, member_expr): (InternedString, Expr) = method_item;
                     if let Expr::FunctionLiteral { params, body, .. } = member_expr {
@@ -1277,7 +1333,6 @@ impl Interpreter {
                     }
                 }
                 let class_value = Value::Table(Rc::new(RefCell::new(class_table)));
-                let _ = superclass;
                 Ok(class_value)
             }
             Expr::NewInstance { class_name, arguments, line } => {
@@ -1304,9 +1359,20 @@ impl Interpreter {
             Expr::This { line: _ } => {
                 Ok(self.this_stack.last().cloned().unwrap_or(Value::Nil))
             }
-            Expr::Super { method, line: _ } => {
-                let _ = method;
-                Ok(Value::Nil)
+            Expr::Super { method, line } => {
+                self.current_line = line;
+                let this = self.this_stack.last().cloned().unwrap_or(Value::Nil);
+                let super_key = self.interner.intern("__superclass__");
+                let superclass = match &this {
+                    Value::Table(t) => t.borrow().get(&super_key).cloned(),
+                    _ => None,
+                };
+                match superclass {
+                    Some(Value::Table(super_t)) => {
+                        Ok(super_t.borrow().get(&method.id()).cloned().unwrap_or(Value::Nil))
+                    }
+                    _ => Ok(Value::Nil),
+                }
             }
             Expr::Set { items, line } => {
             self.current_line = line;
@@ -1435,8 +1501,7 @@ impl Interpreter {
                 exec_result
             }
             Value::AsyncFunction { name, params, default_params, body, closure } => {
-                let new_env = Rc::new(RefCell::new(Environment::with_parent(closure.clone())));
-                let mut param_values = Vec::new();
+                let mut arg_vals = Vec::new();
                 for (i, param_id) in params.iter().enumerate() {
                     let val = if i < args.len() {
                         args[i].clone()
@@ -1449,33 +1514,43 @@ impl Interpreter {
                     } else {
                         Value::Nil
                     };
-                    param_values.push((*param_id, val));
+                    arg_vals.push((*param_id, val));
                 }
-                for (param_id, val) in param_values {
+
+                let new_env = Rc::new(RefCell::new(Environment::with_parent(closure.clone())));
+                for (param_id, val) in arg_vals {
                     new_env.borrow_mut().define(InternedString::new(param_id), val);
                 }
+
                 self.call_stack.push(StackFrame {
                     function: format!("async function {name}"),
                     line: self.current_line,
                 });
-                let future_state = Rc::new(RefCell::new(crate::value::FutureState::Pending));
-                let old_global = std::mem::replace(&mut self.global, new_env.clone());
-                let exec_result = (|| -> Result<Value, String> {
-                    for stmt in &body {
-                        self.execute_stmt(stmt.clone())?;
-                        if self.return_value.is_some() { break; }
-                    }
-                    Ok(self.return_value.take().unwrap_or(Value::Nil))
-                })();
-                self.global = old_global;
                 self.call_stack.pop();
-                match exec_result {
-                    Ok(v) => {
-                        *future_state.borrow_mut() = crate::value::FutureState::Ready(v.clone());
-                        Ok(Value::Future(future_state))
-                    }
-                    Err(e) => Err(e),
+
+                let future_state = Rc::new(RefCell::new(crate::value::FutureState::Deferred {
+                    body: body.clone(),
+                    closure: new_env,
+                    args: vec![],
+                }));
+                Ok(Value::Future(future_state))
+            }
+            Value::Generator { name, params, body, closure, state } => {
+                {
+                    let mut gen_state = state.borrow_mut();
+                    gen_state.yielded_values.clear();
+                    gen_state.consumed_index = 0;
+                    gen_state.is_done = false;
+                    gen_state.execution_state = GeneratorExecutionState::NotStarted;
                 }
+
+                let new_env = Rc::new(RefCell::new(Environment::with_parent(closure.clone())));
+                for (i, param_id) in params.iter().enumerate() {
+                    let val = if i < args.len() { args[i].clone() } else { Value::Nil };
+                    new_env.borrow_mut().define(InternedString::new(*param_id), val);
+                }
+
+                Ok(Value::Generator { name, params, body, closure: new_env, state })
             }
             Value::Generator { name, params, body, closure, state } => {
                 let mut gen_state = state.borrow_mut();
@@ -1703,6 +1778,34 @@ impl Interpreter {
                 }
             }
         }
+    }
+
+    fn bind_pattern(&mut self, pattern: &Pattern, value: &Value) -> Result<(), String> {
+        match pattern {
+            Pattern::Identifier(name) => {
+                self.global.borrow_mut().define(*name, value.clone());
+            }
+            Pattern::Array(patterns) => {
+                if let Value::Array(arr) = value {
+                    let arr_ref = arr.borrow();
+                    for (pat, val) in patterns.iter().zip(arr_ref.iter()) {
+                        self.bind_pattern(pat, val)?;
+                    }
+                }
+            }
+            Pattern::Table(entries) => {
+                if let Value::Table(t) = value {
+                    let t_ref = t.borrow();
+                    for (key, pat) in entries {
+                        if let Some(val) = t_ref.get(&key.id()) {
+                            self.bind_pattern(pat, val)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn instantiate_class(&mut self, class: Value, args: Vec<Value>) -> Result<Value, String> {

@@ -109,6 +109,11 @@ impl Default for GeneratorState {
 pub enum FutureState {
     Pending,
     Ready(Value),
+    Deferred {
+        body: Vec<crate::ast::Stmt>,
+        closure: std::rc::Rc<std::cell::RefCell<crate::environment::Environment>>,
+        args: Vec<Value>,
+    },
 }
 
 impl PartialEq for Value {
@@ -161,6 +166,7 @@ impl fmt::Display for Value {
                 match &*s {
                     FutureState::Pending => write!(f, "<future pending>"),
                     FutureState::Ready(v) => write!(f, "<future {v}>"),
+                    &FutureState::Deferred { .. } => todo!(),
                 }
             }
             Value::Error(msg) => write!(f, "error: {msg}"),
